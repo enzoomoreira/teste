@@ -1,0 +1,56 @@
+# 1. INSTALAR E CARREGAR PACOTES
+# install.packages(c("tidyverse", "tseries", "vars", "lubridate"))
+library(tidyverse)
+library(tseries)
+library(vars)
+library(lubridate)
+
+# 2. CARREGAR E PREPARAR OS DADOS
+# Supondo que a data está no formato "dd/mm/yyyy"
+df <- read.csv("dados.csv", stringsAsFactors = FALSE) %>%
+  mutate(Data = dmy(Data)) %>%
+  arrange(Data)
+
+# Para a análise, vamos focar nos retornos do IBOV, que são mais prováveis de serem estacionários.
+df <- df %>%
+  mutate(
+    log_IBOV = log(IBOV),
+    retorno_IBOV = c(NA, diff(log_IBOV)) # Retorno logarítmico
+  ) %>%
+  na.omit() # Remove a primeira linha com NA
+
+# 3. PRÉ-REQUISITO: TESTAR ESTACIONARIEDADE
+# Modelos como VAR exigem que as séries sejam estacionárias.
+# Um teste comum é o Augmented Dickey-Fuller (ADF).
+# Hipótese nula (H0): a série NÃO é estacionária.
+# Se p-valor < 0.05, rejeitamos H0 e consideramos a série estacionária.
+
+adf.test(df$retorno_IBOV) # Provavelmente será estacionário
+adf.test(df$DY)           # Precisa ser verificado. Se não for, use a diferença: diff(df$DY)
+
+# Vamos criar o objeto de série temporal para a análise (assumindo que DY é estacionário)
+# Se DY não for, use 'DY_diff = c(NA, diff(DY))' e use DY_diff no lugar de DY.
+ts_data <- ts(df[, c("retorno_IBOV", "DY")], start = c(2015, 1), frequency = 12) # Supondo dados mensais
+
+# 4. ANÁLISE DE CAUSALIDADE DE GRANGER
+# Primeiro, selecionamos o número ótimo de defasagens (lags)
+lag_select <- VARselect(ts_data, lag.max = 12, type = "const")
+print(lag_select$selection) # Use o critério AIC ou BIC
+
+# Vamos supor que o lag ótimo seja 2
+granger_DY_IBOV <- causality(VAR(ts_data, p = 2, type = "const"), cause = "DY")
+print(granger_DY_IBOV) # Testa se DY "causa" retorno_IBOV
+
+granger_IBOV_DY <- causality(VAR(ts_data, p = 2, type = "const"), cause = "retorno_IBOV")
+print(granger_IBOV_DY) # Testa se retorno_IBOV "causa" DY
+
+# 5. MODELO VAR E FUNÇÃO DE RESPOSTA AO IMPULSO (IRF)
+var_model <- VAR(ts_data, p = 2, type = "const") # Usando o lag ótimo
+
+# IRF de um choque no DY sobre o retorno_IBOV
+irf_dy <- irf(var_model, impulse = "DY", response = "retorno_IBOV", n.ahead = 24, boot = TRUE)
+plot(irf_dy) # Gera o gráfico!
+
+# IRF de um choque no retorno_IBOV sobre o DY
+irf_ibov <- irf(var_model, impulse = "retorno_IBOV", response = "DY", n.ahead = 24, boot = TRUE)
+plot(irf_ibov)
