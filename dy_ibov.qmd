@@ -13,24 +13,24 @@ editor: visual
 library(tidyverse)
 library(tseries)
 library(vars)
-library(lubridate)
+library(lubriDATA)
 
 # 2. Carregar o novo dataset completo
-# Assumindo que o CSV tem as colunas DATE, IBOV, DY_IBOV, SELIC
+# Assumindo que o CSV tem as colunas DATA, IBOV, DY_IBOV, SELIC
 df <- read.csv2("dados.csv", stringsAsFactors = FALSE) %>%
   mutate(
-    DATE = as.Date(as.numeric(DATE), origin = "1899-12-30"),
-    IBOV = as.numeric(gsub(",", ".", IBOV)),
-    DY_IBOV = as.numeric(DY_IBOV),
+    DATA = as.DATA(DATA),
+    IBOV = as.numeric(IBOV),
+    DY = as.numeric(DY),
     SELIC = as.numeric(SELIC)
   ) %>%
-  arrange(DATE)
+  arrange(DATA)
 
 # 3. Criar todas as variáveis transformadas que vamos precisar
 df_final <- df %>%
   mutate(
     # Proxy de dividendos nominais
-    proxy_dividendos_nominais = IBOV * DY_IBOV,
+    proxy_dividendos_nominais = IBOV * DY,
     
     # Variáveis estacionárias
     retorno_IBOV = c(NA, diff(log(IBOV))),
@@ -86,66 +86,52 @@ plot(irf_base_2, main = "1. Resposta do Cresc. Dividendos a choque no Retorno IB
 
 ```{r}
 #-----------------------------------------------------------------------
-# ANÁLISE 2: ANÁLISE DE REGIMES (PRÉ, DURANTE, PÓS-PANDEMIA) - VERSÃO CORRIGIDA
+# ANÁLISE 2 (CORRIGIDA): ANÁLISE DE REGIMES (PRÉ, DURANTE, PÓS-PANDEMIA)
 #-----------------------------------------------------------------------
 
-# 1. Dividir os dados nos regimes (sem alteração aqui)
-df_pre_pandemia <- df_final %>% filter(DATE < '2020-03-01')
-df_durante_pandemia <- df_final %>% filter(DATE >= '2020-03-01' & DATE <= '2021-12-31')
-df_pos_pandemia <- df_final %>% filter(DATE > '2021-12-31')
+# 1. Dividir os dados nos regimes (CORRIGIDO: usando 'DATA')
+df_pre_pandemia <- df_final %>% filter(DATA < '2020-03-01')
+df_durante_pandemia <- df_final %>% filter(DATA >= '2020-03-01' & DATA <= '2021-12-31')
+df_pos_pandemia <- df_final %>% filter(DATA > '2021-12-31')
 
-# 2. Função de análise corrigida e mais robusta
+# 2. Criar uma função para não repetir o código
 rodar_analise_regime <- function(dados, nome_regime) {
+  print(paste("### INICIANDO ANÁLISE DE REGIME:", nome_regime, "###"))
   
-  # O bloco tryCatch vai executar o código e, se um erro ocorrer,
-  # ele o "captura" e executa a seção 'error', impedindo que o script pare.
-  tryCatch({
+  # Checar se o dataframe tem dados suficientes
+  if(nrow(dados) < 24) { # Um mínimo arbitrário de 2 anos
+    print("Dados insuficientes para análise neste período.")
+    return(NULL)
+  }
+  
+  ts_data <- ts(dados[, c("retorno_IBOV", "crescimento_dividendos")], frequency = 12)
+  
+  # Usar um lag.max menor se o período for curto
+  lag_maximo <- ifelse(nrow(dados) < 60, 4, 12)
+  
+  lag_select <- VARselect(ts_data, lag.max = lag_maximo, type = "const")
+  p_otimo <- lag_select$selection["AIC(n)"]
+  print(paste("Lag ótimo (", nome_regime, "):", p_otimo))
+  
+  if (p_otimo > 0) {
+    var_model <- VAR(ts_data, p = p_otimo, type = "const")
     
-    print(paste("### INICIANDO ANÁLISE DE REGIME:", nome_regime, "###"))
+    print(paste("--- Causalidade (", nome_regime, "): crescimento_dividendos -> retorno_IBOV? ---"))
+    print(causality(var_model, cause = "crescimento_dividendos"))
+    print(paste("--- Causalidade (", nome_regime, "): retorno_IBOV -> crescimento_dividendos? ---"))
+    print(causality(var_model, cause = "retorno_IBOV"))
     
-    # CORREÇÃO: Removido 'frequency = 12', que é incorreto para dados diários.
-    ts_data <- ts(dados[, c("retorno_IBOV", "crescimento_dividendos")])
+    irf1 <- irf(var_model, impulse = "crescimento_dividendos", response = "retorno_IBOV", n.ahead = 12, boot = TRUE)
+    irf2 <- irf(var_model, impulse = "retorno_IBOV", response = "crescimento_dividendos", n.ahead = 12, boot = TRUE)
     
-    # Para dados diários, um lag de até 30 dias é razoável.
-    lag_maximo <- 30 
-    
-    # Verifica se há dados suficientes para a análise
-    if(nrow(dados) < lag_maximo * 2) {
-      print("Dados insuficientes para a análise neste regime. Pulando.")
-      return(NULL)
-    }
-    
-    lag_select <- VARselect(ts_data, lag.max = lag_maximo, type = "const")
-    p_otimo <- lag_select$selection["AIC(n)"]
-    print(paste("Lag ótimo (", nome_regime, "):", p_otimo))
-    
-    # Checagem para garantir que p_otimo é válido
-    if (!is.na(p_otimo) && p_otimo > 0) {
-      var_model <- VAR(ts_data, p = p_otimo, type = "const")
-      
-      print(paste("--- Causalidade (", nome_regime, "): crescimento_dividendos -> retorno_IBOV? ---"))
-      print(causality(var_model, cause = "crescimento_dividendos"))
-      print(paste("--- Causalidade (", nome_regime, "): retorno_IBOV -> crescimento_dividendos? ---"))
-      print(causality(var_model, cause = "retorno_IBOV"))
-      
-      irf1 <- irf(var_model, impulse = "crescimento_dividendos", response = "retorno_IBOV", n.ahead = 20, boot = TRUE)
-      irf2 <- irf(var_model, impulse = "retorno_IBOV", response = "crescimento_dividendos", n.ahead = 20, boot = TRUE)
-      
-      plot(irf1, main = paste("2. Resposta IBOV a choque Div (Regime:", nome_regime, ")"))
-      plot(irf2, main = paste("2. Resposta Div a choque IBOV (Regime:", nome_regime, ")"))
-      
-    } else {
-      print("Não foi possível determinar um lag ótimo > 0. Análise de causalidade não realizada.")
-    }
-    
-  }, error = function(e) {
-    # Se qualquer erro ocorrer dentro do tryCatch, esta mensagem será exibida.
-    print(paste("!!!!! OCORREU UM ERRO na análise do regime:", nome_regime, "!!!!!"))
-    print(e) # Imprime a mensagem de erro específica.
-  })
+    plot(irf1, main = paste("2. Resposta IBOV a choque Div (Regime:", nome_regime, ")"))
+    plot(irf2, main = paste("2. Resposta Div a choque IBOV (Regime:", nome_regime, ")"))
+  } else {
+    print("Não há lags ótimos > 0 para este período, análise VAR não apropriada.")
+  }
 }
 
-# 3. Executar a função para cada regime (sem alteração aqui)
+# 3. Executar a função para cada regime
 rodar_analise_regime(df_pre_pandemia, "Pre-Pandemia")
 rodar_analise_regime(df_durante_pandemia, "Durante-Pandemia")
 rodar_analise_regime(df_pos_pandemia, "Pos-Pandemia")
