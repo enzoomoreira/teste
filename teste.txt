@@ -1,56 +1,61 @@
-# 1. INSTALAR E CARREGAR PACOTES
-# install.packages(c("tidyverse", "tseries", "vars", "lubridate"))
+# 1. Carregar pacotes
 library(tidyverse)
 library(tseries)
 library(vars)
 library(lubridate)
 
-# 2. CARREGAR E PREPARAR OS DADOS
-# Supondo que a data está no formato "dd/mm/yyyy"
-df <- read.csv("dados.csv", stringsAsFactors = FALSE) %>%
-  mutate(Data = dmy(Data)) %>%
-  arrange(Data)
-
-# Para a análise, vamos focar nos retornos do IBOV, que são mais prováveis de serem estacionários.
-df <- df %>%
+# 2. Carregar e preparar os dados
+df <- read.csv2("dy_ibov.csv", stringsAsFactors = FALSE) %>%
   mutate(
-    log_IBOV = log(IBOV),
-    retorno_IBOV = c(NA, diff(log_IBOV)) # Retorno logarítmico
+    DATE = dmy(DATE),
+    IBOV = as.numeric(gsub(",", ".", IBOV)),
+    DY_IBOV = as.numeric(gsub(",", ".", DY_IBOV))
   ) %>%
-  na.omit() # Remove a primeira linha com NA
+  arrange(DATE)
 
-# 3. PRÉ-REQUISITO: TESTAR ESTACIONARIEDADE
-# Modelos como VAR exigem que as séries sejam estacionárias.
-# Um teste comum é o Augmented Dickey-Fuller (ADF).
-# Hipótese nula (H0): a série NÃO é estacionária.
-# Se p-valor < 0.05, rejeitamos H0 e consideramos a série estacionária.
+# 3. Criar proxy de crescimento dos dividendos e retornos do IBOV
+df_transformado <- df %>%
+  mutate(
+    # Proxy para o fluxo nominal de dividendos
+    proxy_dividendos_nominais = IBOV * DY_IBOV,
+    
+    # Variação logarítmica (crescimento) da proxy de dividendos
+    crescimento_dividendos = c(NA, diff(log(proxy_dividendos_nominais))),
+    
+    # Retorno logarítmico do IBOV (mesmo de antes)
+    retorno_IBOV = c(NA, diff(log(IBOV)))
+  ) %>%
+  # Remove as linhas com NA geradas pelos cálculos de diff()
+  na.omit()
 
-adf.test(df$retorno_IBOV) # Provavelmente será estacionário
-adf.test(df$DY)           # Precisa ser verificado. Se não for, use a diferença: diff(df$DY)
+# 4. Testar estacionariedade das novas séries
+print("--- Teste ADF para retorno_IBOV ---")
+adf.test(df_transformado$retorno_IBOV)
 
-# Vamos criar o objeto de série temporal para a análise (assumindo que DY é estacionário)
-# Se DY não for, use 'DY_diff = c(NA, diff(DY))' e use DY_diff no lugar de DY.
-ts_data <- ts(df[, c("retorno_IBOV", "DY")], start = c(2015, 1), frequency = 12) # Supondo dados mensais
+print("--- Teste ADF para crescimento_dividendos ---")
+adf.test(df_transformado$crescimento_dividendos)
 
-# 4. ANÁLISE DE CAUSALIDADE DE GRANGER
-# Primeiro, selecionamos o número ótimo de defasagens (lags)
-lag_select <- VARselect(ts_data, lag.max = 12, type = "const")
-print(lag_select$selection) # Use o critério AIC ou BIC
+# 5. Selecionar lag ótimo e rodar o modelo VAR
+ts_data_final <- ts(df_transformado[, c("retorno_IBOV", "crescimento_dividendos")], frequency = 12)
 
-# Vamos supor que o lag ótimo seja 2
-granger_DY_IBOV <- causality(VAR(ts_data, p = 2, type = "const"), cause = "DY")
-print(granger_DY_IBOV) # Testa se DY "causa" retorno_IBOV
+print("--- Seleção de Lags (p) para o Modelo Final ---")
+lag_select <- VARselect(ts_data_final, lag.max = 12, type = "const")
+print(lag_select$selection)
 
-granger_IBOV_DY <- causality(VAR(ts_data, p = 2, type = "const"), cause = "retorno_IBOV")
-print(granger_IBOV_DY) # Testa se retorno_IBOV "causa" DY
+p_otimo <- lag_select$selection["AIC(n)"]
+print(paste("Lag ótimo escolhido (AIC):", p_otimo))
+var_model_final <- VAR(ts_data_final, p = p_otimo, type = "const")
 
-# 5. MODELO VAR E FUNÇÃO DE RESPOSTA AO IMPULSO (IRF)
-var_model <- VAR(ts_data, p = 2, type = "const") # Usando o lag ótimo
+# 6. Testar Causalidade de Granger com as novas variáveis
+print("--- Causalidade: crescimento_dividendos -> retorno_IBOV? ---")
+print(causality(var_model_final, cause = "crescimento_dividendos"))
 
-# IRF de um choque no DY sobre o retorno_IBOV
-irf_dy <- irf(var_model, impulse = "DY", response = "retorno_IBOV", n.ahead = 24, boot = TRUE)
-plot(irf_dy) # Gera o gráfico!
+print("--- Causalidade: retorno_IBOV -> crescimento_dividendos? ---")
+print(causality(var_model_final, cause = "retorno_IBOV"))
 
-# IRF de um choque no retorno_IBOV sobre o DY
-irf_ibov <- irf(var_model, impulse = "retorno_IBOV", response = "DY", n.ahead = 24, boot = TRUE)
-plot(irf_ibov)
+# 7. Gerar e plotar as novas Funções de Resposta ao Impulso (IRF)
+irf_cresc_div <- irf(var_model_final, impulse = "crescimento_dividendos", response = "retorno_IBOV", n.ahead = 24, boot = TRUE)
+irf_ret_ibov <- irf(var_model_final, impulse = "retorno_IBOV", response = "crescimento_dividendos", n.ahead = 24, boot = TRUE)
+
+plot(irf_cresc_div, main = "Resposta do Retorno IBOV a um choque no Crescimento dos Dividendos")
+plot(irf_ret_ibov, main = "Resposta do Crescimento dos Dividendos a um choque no Retorno IBOV")
