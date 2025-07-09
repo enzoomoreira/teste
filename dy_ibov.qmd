@@ -6,173 +6,161 @@ editor: visual
 
 ```{r}
 #-----------------------------------------------------------------------
-# SETUP E PREPARAÇÃO
+# CÉLULA 1: SETUP, CARGA E AGREGAÇÃO MENSAL
 #-----------------------------------------------------------------------
 
 # 1. Carregar pacotes
 library(tidyverse)
 library(tseries)
 library(vars)
-library(lubriDATA)
+library(lubridate)
+library(strucchange)
 
-# 2. Carregar o novo dataset completo
-# Assumindo que o CSV tem as colunas DATA, IBOV, DY_IBOV, SELIC
-df <- read.csv2("dados.csv", stringsAsFactors = FALSE) %>%
+# 2. Carregar o dataset com as configurações corretas
+df <- read.csv2("dados.csv", sep = ";", stringsAsFactors = FALSE) %>%
   mutate(
-    DATA = as.DATA(DATA),
+    DATA = as.Date(DATA, format="%Y-%m-%d"), 
     IBOV = as.numeric(IBOV),
-    DY = as.numeric(DY),
+    DY = as.numeric(DY) / 100, # Sua correção do DY
     SELIC = as.numeric(SELIC)
   ) %>%
+  na.omit() %>%
   arrange(DATA)
 
-# 3. Criar todas as variáveis transformadas que vamos precisar
-df_final <- df %>%
+# 3. Criar variáveis diárias e LIMPAR dados inválidos
+df_diario_transformado <- df %>%
   mutate(
-    # Proxy de dividendos nominais
     proxy_dividendos_nominais = IBOV * DY,
-    
-    # Variáveis estacionárias
     retorno_IBOV = c(NA, diff(log(IBOV))),
     crescimento_dividendos = c(NA, diff(log(proxy_dividendos_nominais))),
-    
-    # Converte SELIC anual para mensal e depois calcula a diferença
-    selic_mensal = (1 + SELIC/100)^(1/12) - 1,
-    diff_SELIC = c(NA, diff(selic_mensal))
+    diff_SELIC = c(NA, diff(SELIC)) # Para o VAR de 3 variáveis
+  ) %>%
+  # Limpeza crítica que garante que apenas dados numéricos finitos prossigam
+  filter(is.finite(retorno_IBOV) & is.finite(crescimento_dividendos))
+
+# 4. AGREGAR DADOS PARA FREQUÊNCIA MENSAL
+df_mensal <- df_diario_transformado %>%
+  mutate(mes_ano = floor_date(DATA, "month")) %>%
+  group_by(mes_ano) %>%
+  summarise(
+    retorno_IBOV = sum(retorno_IBOV, na.rm = TRUE),
+    crescimento_dividendos = sum(crescimento_dividendos, na.rm = TRUE),
+    diff_SELIC = sum(diff_SELIC, na.rm = TRUE)
+  ) %>%
+  rename(DATA = mes_ano)
+```
+
+```{r}
+#-----------------------------------------------------------------------
+# CÉLULA 2: ANÁLISE 1 - BIVARIADA (PERÍODO COMPLETO)
+#-----------------------------------------------------------------------
+
+print("------------------------------------------------------")
+print("### ANÁLISE 1: PERÍODO COMPLETO (BIVARIADA) ###")
+
+ts_data_base <- ts(df_mensal[, c("retorno_IBOV", "crescimento_dividendos")], start=c(year(min(df_mensal$DATA)), month(min(df_mensal$DATA))), frequency = 12)
+lag_select_base <- VARselect(ts_data_base, lag.max = 12, type = "const")
+p_otimo_base <- lag_select_base$selection["AIC(n)"]
+print(paste("Lag ótimo:", p_otimo_base))
+
+if(p_otimo_base > 0) {
+  var_model_base <- VAR(ts_data_base, p = p_otimo_base, type = "const")
+  print("--- Causalidade: crescimento_dividendos -> retorno_IBOV? ---")
+  print(causality(var_model_base, cause = "crescimento_dividendos"))
+  print("--- Causalidade: retorno_IBOV -> crescimento_dividendos? ---")
+  print(causality(var_model_base, cause = "retorno_IBOV"))
+}
+```
+
+```{r}
+#-----------------------------------------------------------------------
+# CÉLULA 3: ANÁLISE 2 - MULTIVARIADA COM SELIC (PERÍODO COMPLETO)
+#-----------------------------------------------------------------------
+
+print("------------------------------------------------------")
+print("### ANÁLISE 2: MULTIVARIADA COM SELIC (PERÍODO COMPLETO) ###")
+
+ts_data_multi <- ts(df_mensal[, c("retorno_IBOV", "crescimento_dividendos", "diff_SELIC")], start=c(year(min(df_mensal$DATA)), month(min(df_mensal$DATA))), frequency = 12)
+lag_select_multi <- VARselect(ts_data_multi, lag.max = 12, type = "const")
+p_otimo_multi <- lag_select_multi$selection["AIC(n)"]
+print(paste("Lag ótimo:", p_otimo_multi))
+
+if(p_otimo_multi > 0) {
+    var_model_multi <- VAR(ts_data_multi, p = p_otimo_multi, type = "const")
+    print("--- Causalidade (Contr. Juros): crescimento_dividendos -> retorno_IBOV? ---")
+    print(causality(var_model_multi, cause = "crescimento_dividendos"))
+    print("--- Causalidade (Contr. Div): diff_SELIC -> retorno_IBOV? ---")
+    print(causality(var_model_multi, cause = "diff_SELIC"))
+}
+```
+
+```{r}
+#-----------------------------------------------------------------------
+# CÉLULA 4: ANÁLISE 3 - DETECÇÃO DE QUEBRA ESTRUTURAL
+#-----------------------------------------------------------------------
+
+print("------------------------------------------------------")
+print("### ANÁLISE 3: DETECÇÃO DE QUEBRA ESTRUTURAL ###")
+
+df_teste_quebra <- df_mensal %>%
+  mutate(
+    retorno_IBOV_lag1 = lag(retorno_IBOV, 1),
+    cresc_div_lag1 = lag(crescimento_dividendos, 1)
   ) %>%
   na.omit()
 
-# 4. Testar a estacionariedade de todas as nossas variáveis
-print("--- Teste ADF para retorno_IBOV ---")
-adf.test(df_final$retorno_IBOV)
+modelo_quebra <- crescimento_dividendos ~ cresc_div_lag1 + retorno_IBOV_lag1
+fs <- Fstats(modelo_quebra, data = df_teste_quebra)
+bp <- breakpoints(fs)
 
-print("--- Teste ADF para crescimento_dividendos ---")
-adf.test(df_final$crescimento_dividendos)
-
-print("--- Teste ADF para diff_SELIC ---")
-adf.test(df_final$diff_SELIC)
-```
-
-```{r}
-#-----------------------------------------------------------------------
-# ANÁLISE 1: MODELO BASE BIVARIADO (PERÍODO COMPLETO)
-#-----------------------------------------------------------------------
-
-print("### INICIANDO ANÁLISE 1: PERÍODO COMPLETO ###")
-
-# Criar a série temporal para o período completo
-ts_data_base <- ts(df_final[, c("retorno_IBOV", "crescimento_dividendos")], frequency = 12)
-
-# Selecionar lag e rodar o VAR
-lag_select_base <- VARselect(ts_data_base, lag.max = 12, type = "const")
-p_otimo_base <- lag_select_base$selection["AIC(n)"]
-print(paste("Lag ótimo (Base):", p_otimo_base))
-var_model_base <- VAR(ts_data_base, p = p_otimo_base, type = "const")
-
-# Testar Causalidade de Granger
-print("--- Causalidade (Base): crescimento_dividendos -> retorno_IBOV? ---")
-print(causality(var_model_base, cause = "crescimento_dividendos"))
-print("--- Causalidade (Base): retorno_IBOV -> crescimento_dividendos? ---")
-print(causality(var_model_base, cause = "retorno_IBOV"))
-
-# Funções de Resposta ao Impulso (IRF)
-irf_base_1 <- irf(var_model_base, impulse = "crescimento_dividendos", response = "retorno_IBOV", n.ahead = 24, boot = TRUE)
-irf_base_2 <- irf(var_model_base, impulse = "retorno_IBOV", response = "crescimento_dividendos", n.ahead = 24, boot = TRUE)
-
-# Plotar gráficos
-plot(irf_base_1, main = "1. Resposta do Retorno IBOV a choque no Cresc. Dividendos (Base)")
-plot(irf_base_2, main = "1. Resposta do Cresc. Dividendos a choque no Retorno IBOV (Base)")
-```
-
-```{r}
-#-----------------------------------------------------------------------
-# ANÁLISE 2 (CORRIGIDA): ANÁLISE DE REGIMES (PRÉ, DURANTE, PÓS-PANDEMIA)
-#-----------------------------------------------------------------------
-
-# 1. Dividir os dados nos regimes (CORRIGIDO: usando 'DATA')
-df_pre_pandemia <- df_final %>% filter(DATA < '2020-03-01')
-df_durante_pandemia <- df_final %>% filter(DATA >= '2020-03-01' & DATA <= '2021-12-31')
-df_pos_pandemia <- df_final %>% filter(DATA > '2021-12-31')
-
-# 2. Criar uma função para não repetir o código
-rodar_analise_regime <- function(dados, nome_regime) {
-  print(paste("### INICIANDO ANÁLISE DE REGIME:", nome_regime, "###"))
-  
-  # Checar se o dataframe tem dados suficientes
-  if(nrow(dados) < 24) { # Um mínimo arbitrário de 2 anos
-    print("Dados insuficientes para análise neste período.")
-    return(NULL)
-  }
-  
-  ts_data <- ts(dados[, c("retorno_IBOV", "crescimento_dividendos")], frequency = 12)
-  
-  # Usar um lag.max menor se o período for curto
-  lag_maximo <- ifelse(nrow(dados) < 60, 4, 12)
-  
-  lag_select <- VARselect(ts_data, lag.max = lag_maximo, type = "const")
-  p_otimo <- lag_select$selection["AIC(n)"]
-  print(paste("Lag ótimo (", nome_regime, "):", p_otimo))
-  
-  if (p_otimo > 0) {
-    var_model <- VAR(ts_data, p = p_otimo, type = "const")
-    
-    print(paste("--- Causalidade (", nome_regime, "): crescimento_dividendos -> retorno_IBOV? ---"))
-    print(causality(var_model, cause = "crescimento_dividendos"))
-    print(paste("--- Causalidade (", nome_regime, "): retorno_IBOV -> crescimento_dividendos? ---"))
-    print(causality(var_model, cause = "retorno_IBOV"))
-    
-    irf1 <- irf(var_model, impulse = "crescimento_dividendos", response = "retorno_IBOV", n.ahead = 12, boot = TRUE)
-    irf2 <- irf(var_model, impulse = "retorno_IBOV", response = "crescimento_dividendos", n.ahead = 12, boot = TRUE)
-    
-    plot(irf1, main = paste("2. Resposta IBOV a choque Div (Regime:", nome_regime, ")"))
-    plot(irf2, main = paste("2. Resposta Div a choque IBOV (Regime:", nome_regime, ")"))
-  } else {
-    print("Não há lags ótimos > 0 para este período, análise VAR não apropriada.")
-  }
+data_da_quebra <- NULL
+if (!is.na(bp$breakpoints[1])) {
+  break_observation_index <- bp$breakpoints[1]
+  data_da_quebra <- df_teste_quebra$DATA[break_observation_index]
+  print(paste("--> Data mais provável da quebra estrutural encontrada:", format(data_da_quebra, "%Y-%m")))
+  plot(fs, main="Teste de Quebra Estrutural")
+  lines(bp, col = "blue", lwd = 2)
+} else {
+  print("Nenhum ponto de quebra estatisticamente significante foi encontrado.")
 }
-
-# 3. Executar a função para cada regime
-rodar_analise_regime(df_pre_pandemia, "Pre-Pandemia")
-rodar_analise_regime(df_durante_pandemia, "Durante-Pandemia")
-rodar_analise_regime(df_pos_pandemia, "Pos-Pandemia")
 ```
 
 ```{r}
 #-----------------------------------------------------------------------
-# ANÁLISE 3: MODELO VAR MULTIVARIADO (COM CONTROLE DA SELIC)
+# CÉLULA 5: ANÁLISE 4 - ANÁLISE SEGMENTADA (ANTES E DEPOIS DA QUEBRA)
 #-----------------------------------------------------------------------
 
-print("### INICIANDO ANÁLISE 3: MODELO MULTIVARIADO COM SELIC ###")
+# Esta célula só roda se uma data de quebra foi encontrada na Célula 4
+if(!is.null(data_da_quebra)) {
 
-# 1. Criar a série temporal de 3 variáveis
-ts_data_multi <- ts(df_final[, c("retorno_IBOV", "crescimento_dividendos", "diff_SELIC")], frequency = 12)
+  df_antes_quebra <- df_mensal %>% filter(DATA < data_da_quebra)
+  df_depois_quebra <- df_mensal %>% filter(DATA >= data_da_quebra)
 
-# 2. Selecionar lag e rodar o VAR multivariado
-lag_select_multi <- VARselect(ts_data_multi, lag.max = 12, type = "const")
-p_otimo_multi <- lag_select_multi$selection["AIC(n)"]
-print(paste("Lag ótimo (Multivariado):", p_otimo_multi))
-var_model_multi <- VAR(ts_data_multi, p = p_otimo_multi, type = "const")
+  rodar_analise_segmentada <- function(dados, nome_periodo) {
+    print("------------------------------------------------------")
+    print(paste("### ANÁLISE SEGMENTADA:", nome_periodo, "###"))
+    print(paste("Observações (meses):", nrow(dados)))
 
-# 3. Testar Causalidade de Granger no novo modelo
-# Agora o teste controla pela presença da outra variável
-print("--- Causalidade (Multivariado): crescimento_dividendos -> retorno_IBOV? ---")
-print(causality(var_model_multi, cause = "crescimento_dividendos"))
+    if(nrow(dados) < 24) { print("Dados insuficientes. Pulando."); return(invisible(NULL)) }
+    
+    ts_data <- ts(dados[, c("retorno_IBOV", "crescimento_dividendos")], start=c(year(min(dados$DATA)), month(min(dados$DATA))), frequency = 12)
+    lag_select <- VARselect(ts_data, lag.max = 6, type = "const")
+    p_otimo <- lag_select$selection["AIC(n)"]
+    print(paste("Lag ótimo:", p_otimo))
+    
+    if (p_otimo > 0) {
+      var_model <- VAR(ts_data, p = p_otimo, type = "const")
+      print(paste("--- Causalidade (", nome_periodo, "): crescimento_dividendos -> retorno_IBOV? ---"))
+      print(causality(var_model, cause = "crescimento_dividendos"))
+      print(paste("--- Causalidade (", nome_periodo, "): retorno_IBOV -> crescimento_dividendos? ---"))
+      print(causality(var_model, cause = "retorno_IBOV"))
+    }
+  }
 
-print("--- Causalidade (Multivariado): retorno_IBOV -> crescimento_dividendos? ---")
-print(causality(var_model_multi, cause = "retorno_IBOV"))
+  rodar_analise_segmentada(df_antes_quebra, "Antes da Quebra")
+  rodar_analise_segmentada(df_depois_quebra, "Depois da Quebra")
 
-print("--- Causalidade (Multivariado): diff_SELIC -> retorno_IBOV? ---")
-print(causality(var_model_multi, cause = "diff_SELIC"))
-
-# 4. Funções de Resposta ao Impulso (IRF)
-# Veremos como o IBOV reage a choques nas outras variáveis, controlando por todas
-irf_multi_div_ibov <- irf(var_model_multi, impulse = "crescimento_dividendos", response = "retorno_IBOV", n.ahead = 24, boot = TRUE)
-irf_multi_selic_ibov <- irf(var_model_multi, impulse = "diff_SELIC", response = "retorno_IBOV", n.ahead = 24, boot = TRUE)
-irf_multi_selic_div <- irf(var_model_multi, impulse = "diff_SELIC", response = "crescimento_dividendos", n.ahead = 24, boot = TRUE)
-
-
-# 5. Plotar os gráficos mais relevantes
-plot(irf_multi_div_ibov, main = "3. Resposta IBOV a choque Div (Contr. SELIC)")
-plot(irf_multi_selic_ibov, main = "3. Resposta IBOV a choque SELIC")
-plot(irf_multi_selic_div, main = "3. Resposta Cresc. Div a choque SELIC")
+} else {
+  print("Análise segmentada não foi executada porque nenhuma quebra foi encontrada.")
+}
 ```
