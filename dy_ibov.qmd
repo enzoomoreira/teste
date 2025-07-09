@@ -1,0 +1,192 @@
+---
+title: "Analise_IBOV_DY"
+format: html
+editor: visual
+---
+
+```{r}
+#-----------------------------------------------------------------------
+# SETUP E PREPARAÇÃO
+#-----------------------------------------------------------------------
+
+# 1. Carregar pacotes
+library(tidyverse)
+library(tseries)
+library(vars)
+library(lubridate)
+
+# 2. Carregar o novo dataset completo
+# Assumindo que o CSV tem as colunas DATE, IBOV, DY_IBOV, SELIC
+df <- read.csv2("dados.csv", stringsAsFactors = FALSE) %>%
+  mutate(
+    DATE = as.Date(as.numeric(DATE), origin = "1899-12-30"),
+    IBOV = as.numeric(gsub(",", ".", IBOV)),
+    DY_IBOV = as.numeric(DY_IBOV),
+    SELIC = as.numeric(SELIC)
+  ) %>%
+  arrange(DATE)
+
+# 3. Criar todas as variáveis transformadas que vamos precisar
+df_final <- df %>%
+  mutate(
+    # Proxy de dividendos nominais
+    proxy_dividendos_nominais = IBOV * DY_IBOV,
+    
+    # Variáveis estacionárias
+    retorno_IBOV = c(NA, diff(log(IBOV))),
+    crescimento_dividendos = c(NA, diff(log(proxy_dividendos_nominais))),
+    
+    # Converte SELIC anual para mensal e depois calcula a diferença
+    selic_mensal = (1 + SELIC/100)^(1/12) - 1,
+    diff_SELIC = c(NA, diff(selic_mensal))
+  ) %>%
+  na.omit()
+
+# 4. Testar a estacionariedade de todas as nossas variáveis
+print("--- Teste ADF para retorno_IBOV ---")
+adf.test(df_final$retorno_IBOV)
+
+print("--- Teste ADF para crescimento_dividendos ---")
+adf.test(df_final$crescimento_dividendos)
+
+print("--- Teste ADF para diff_SELIC ---")
+adf.test(df_final$diff_SELIC)
+```
+
+```{r}
+#-----------------------------------------------------------------------
+# ANÁLISE 1: MODELO BASE BIVARIADO (PERÍODO COMPLETO)
+#-----------------------------------------------------------------------
+
+print("### INICIANDO ANÁLISE 1: PERÍODO COMPLETO ###")
+
+# Criar a série temporal para o período completo
+ts_data_base <- ts(df_final[, c("retorno_IBOV", "crescimento_dividendos")], frequency = 12)
+
+# Selecionar lag e rodar o VAR
+lag_select_base <- VARselect(ts_data_base, lag.max = 12, type = "const")
+p_otimo_base <- lag_select_base$selection["AIC(n)"]
+print(paste("Lag ótimo (Base):", p_otimo_base))
+var_model_base <- VAR(ts_data_base, p = p_otimo_base, type = "const")
+
+# Testar Causalidade de Granger
+print("--- Causalidade (Base): crescimento_dividendos -> retorno_IBOV? ---")
+print(causality(var_model_base, cause = "crescimento_dividendos"))
+print("--- Causalidade (Base): retorno_IBOV -> crescimento_dividendos? ---")
+print(causality(var_model_base, cause = "retorno_IBOV"))
+
+# Funções de Resposta ao Impulso (IRF)
+irf_base_1 <- irf(var_model_base, impulse = "crescimento_dividendos", response = "retorno_IBOV", n.ahead = 24, boot = TRUE)
+irf_base_2 <- irf(var_model_base, impulse = "retorno_IBOV", response = "crescimento_dividendos", n.ahead = 24, boot = TRUE)
+
+# Plotar gráficos
+plot(irf_base_1, main = "1. Resposta do Retorno IBOV a choque no Cresc. Dividendos (Base)")
+plot(irf_base_2, main = "1. Resposta do Cresc. Dividendos a choque no Retorno IBOV (Base)")
+```
+
+```{r}
+#-----------------------------------------------------------------------
+# ANÁLISE 2: ANÁLISE DE REGIMES (PRÉ, DURANTE, PÓS-PANDEMIA) - VERSÃO CORRIGIDA
+#-----------------------------------------------------------------------
+
+# 1. Dividir os dados nos regimes (sem alteração aqui)
+df_pre_pandemia <- df_final %>% filter(DATE < '2020-03-01')
+df_durante_pandemia <- df_final %>% filter(DATE >= '2020-03-01' & DATE <= '2021-12-31')
+df_pos_pandemia <- df_final %>% filter(DATE > '2021-12-31')
+
+# 2. Função de análise corrigida e mais robusta
+rodar_analise_regime <- function(dados, nome_regime) {
+  
+  # O bloco tryCatch vai executar o código e, se um erro ocorrer,
+  # ele o "captura" e executa a seção 'error', impedindo que o script pare.
+  tryCatch({
+    
+    print(paste("### INICIANDO ANÁLISE DE REGIME:", nome_regime, "###"))
+    
+    # CORREÇÃO: Removido 'frequency = 12', que é incorreto para dados diários.
+    ts_data <- ts(dados[, c("retorno_IBOV", "crescimento_dividendos")])
+    
+    # Para dados diários, um lag de até 30 dias é razoável.
+    lag_maximo <- 30 
+    
+    # Verifica se há dados suficientes para a análise
+    if(nrow(dados) < lag_maximo * 2) {
+      print("Dados insuficientes para a análise neste regime. Pulando.")
+      return(NULL)
+    }
+    
+    lag_select <- VARselect(ts_data, lag.max = lag_maximo, type = "const")
+    p_otimo <- lag_select$selection["AIC(n)"]
+    print(paste("Lag ótimo (", nome_regime, "):", p_otimo))
+    
+    # Checagem para garantir que p_otimo é válido
+    if (!is.na(p_otimo) && p_otimo > 0) {
+      var_model <- VAR(ts_data, p = p_otimo, type = "const")
+      
+      print(paste("--- Causalidade (", nome_regime, "): crescimento_dividendos -> retorno_IBOV? ---"))
+      print(causality(var_model, cause = "crescimento_dividendos"))
+      print(paste("--- Causalidade (", nome_regime, "): retorno_IBOV -> crescimento_dividendos? ---"))
+      print(causality(var_model, cause = "retorno_IBOV"))
+      
+      irf1 <- irf(var_model, impulse = "crescimento_dividendos", response = "retorno_IBOV", n.ahead = 20, boot = TRUE)
+      irf2 <- irf(var_model, impulse = "retorno_IBOV", response = "crescimento_dividendos", n.ahead = 20, boot = TRUE)
+      
+      plot(irf1, main = paste("2. Resposta IBOV a choque Div (Regime:", nome_regime, ")"))
+      plot(irf2, main = paste("2. Resposta Div a choque IBOV (Regime:", nome_regime, ")"))
+      
+    } else {
+      print("Não foi possível determinar um lag ótimo > 0. Análise de causalidade não realizada.")
+    }
+    
+  }, error = function(e) {
+    # Se qualquer erro ocorrer dentro do tryCatch, esta mensagem será exibida.
+    print(paste("!!!!! OCORREU UM ERRO na análise do regime:", nome_regime, "!!!!!"))
+    print(e) # Imprime a mensagem de erro específica.
+  })
+}
+
+# 3. Executar a função para cada regime (sem alteração aqui)
+rodar_analise_regime(df_pre_pandemia, "Pre-Pandemia")
+rodar_analise_regime(df_durante_pandemia, "Durante-Pandemia")
+rodar_analise_regime(df_pos_pandemia, "Pos-Pandemia")
+```
+
+```{r}
+#-----------------------------------------------------------------------
+# ANÁLISE 3: MODELO VAR MULTIVARIADO (COM CONTROLE DA SELIC)
+#-----------------------------------------------------------------------
+
+print("### INICIANDO ANÁLISE 3: MODELO MULTIVARIADO COM SELIC ###")
+
+# 1. Criar a série temporal de 3 variáveis
+ts_data_multi <- ts(df_final[, c("retorno_IBOV", "crescimento_dividendos", "diff_SELIC")], frequency = 12)
+
+# 2. Selecionar lag e rodar o VAR multivariado
+lag_select_multi <- VARselect(ts_data_multi, lag.max = 12, type = "const")
+p_otimo_multi <- lag_select_multi$selection["AIC(n)"]
+print(paste("Lag ótimo (Multivariado):", p_otimo_multi))
+var_model_multi <- VAR(ts_data_multi, p = p_otimo_multi, type = "const")
+
+# 3. Testar Causalidade de Granger no novo modelo
+# Agora o teste controla pela presença da outra variável
+print("--- Causalidade (Multivariado): crescimento_dividendos -> retorno_IBOV? ---")
+print(causality(var_model_multi, cause = "crescimento_dividendos"))
+
+print("--- Causalidade (Multivariado): retorno_IBOV -> crescimento_dividendos? ---")
+print(causality(var_model_multi, cause = "retorno_IBOV"))
+
+print("--- Causalidade (Multivariado): diff_SELIC -> retorno_IBOV? ---")
+print(causality(var_model_multi, cause = "diff_SELIC"))
+
+# 4. Funções de Resposta ao Impulso (IRF)
+# Veremos como o IBOV reage a choques nas outras variáveis, controlando por todas
+irf_multi_div_ibov <- irf(var_model_multi, impulse = "crescimento_dividendos", response = "retorno_IBOV", n.ahead = 24, boot = TRUE)
+irf_multi_selic_ibov <- irf(var_model_multi, impulse = "diff_SELIC", response = "retorno_IBOV", n.ahead = 24, boot = TRUE)
+irf_multi_selic_div <- irf(var_model_multi, impulse = "diff_SELIC", response = "crescimento_dividendos", n.ahead = 24, boot = TRUE)
+
+
+# 5. Plotar os gráficos mais relevantes
+plot(irf_multi_div_ibov, main = "3. Resposta IBOV a choque Div (Contr. SELIC)")
+plot(irf_multi_selic_ibov, main = "3. Resposta IBOV a choque SELIC")
+plot(irf_multi_selic_div, main = "3. Resposta Cresc. Div a choque SELIC")
+```
