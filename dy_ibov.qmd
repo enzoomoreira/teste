@@ -164,3 +164,233 @@ if(!is.null(data_da_quebra)) {
   print("Análise segmentada não foi executada porque nenhuma quebra foi encontrada.")
 }
 ```
+
+```{r}
+#-----------------------------------------------------------------------
+# CÉLULA 6: VISUALIZAÇÃO DA MUDANÇA ESTRUTURAL
+#-----------------------------------------------------------------------
+
+# Esta célula só roda se uma data de quebra foi encontrada na Célula 4
+if(!is.null(data_da_quebra)) {
+
+  print("------------------------------------------------------")
+  print("### GERANDO GRÁFICO FINAL DE VISUALIZAÇÃO ###")
+
+  # Fator de escala para ajustar o DY à escala do IBOV
+  # Pega o valor máximo do IBOV e divide pelo máximo do DY (em decimal)
+  scaling_factor <- max(df$IBOV) / max(df$DY)
+
+  # Criar o gráfico com ggplot2
+  grafico_final <- ggplot(df, aes(x = DATA)) +
+    
+    # Linha do Ibovespa (eixo da esquerda)
+    geom_line(aes(y = IBOV, color = "Ibovespa"), size = 1) +
+    
+    # Linha do Dividend Yield (eixo da direita, ajustado pela escala)
+    geom_line(aes(y = DY * scaling_factor, color = "Dividend Yield"), size = 1) +
+    
+    # Linha vertical marcando a data da quebra estrutural
+    geom_vline(xintercept = as.numeric(data_da_quebra), 
+               linetype = "dashed", 
+               color = "red", 
+               size = 1) +
+    
+    # Configuração do eixo Y duplo
+    scale_y_continuous(
+      # Eixo da Esquerda (Primário)
+      name = "Ibovespa (Pontos)",
+      # Eixo da Direita (Secundário)
+      # A fórmula ~./scaling_factor reverte a escala para mostrar os valores corretos do DY
+      sec.axis = sec_axis(~./scaling_factor, 
+                          name = "Dividend Yield (%)",
+                          labels = scales::percent_format(accuracy = 0.1))
+    ) +
+    
+    # Títulos e legendas
+    labs(
+      title = "Dinâmica do Ibovespa vs. Dividend Yield com Quebra Estrutural",
+      subtitle = paste("Linha tracejada marca a quebra mais provável em", format(data_da_quebra, "%B de %Y")),
+      x = "Data",
+      y = "",
+      color = "Métrica"
+    ) +
+    
+    # Tema e posicionamento da legenda
+    theme_minimal() +
+    theme(legend.position = "top")
+
+  # Imprimir o gráfico
+  print(grafico_final)
+}
+```
+
+```{r}
+#-----------------------------------------------------------------------
+# CÉLULA 1: PREPARANDO O MODELO PARA DIAGNÓSTICO
+#-----------------------------------------------------------------------
+library(tidyverse)
+library(vars)
+library(lubridate)
+
+# Preparação dos dados (código já validado)
+df <- read.csv2("dados.csv", sep = ";", stringsAsFactors = FALSE) %>%
+  mutate(
+    DATA = as.Date(DATA, format="%Y-%m-%d"), 
+    IBOV = as.numeric(IBOV),
+    DY = as.numeric(DY) / 100,
+    SELIC = as.numeric(SELIC)
+  ) %>%
+  na.omit() %>%
+  arrange(DATA)
+
+df_diario_transformado <- df %>%
+  mutate(
+    proxy_dividendos_nominais = IBOV * DY,
+    retorno_IBOV = c(NA, diff(log(IBOV))),
+    crescimento_dividendos = c(NA, diff(log(proxy_dividendos_nominais)))
+  ) %>%
+  filter(is.finite(retorno_IBOV) & is.finite(crescimento_dividendos))
+
+df_mensal <- df_diario_transformado %>%
+  mutate(mes_ano = floor_date(DATA, "month")) %>%
+  group_by(mes_ano) %>%
+  summarise(
+    retorno_IBOV = sum(retorno_IBOV, na.rm = TRUE),
+    crescimento_dividendos = sum(crescimento_dividendos, na.rm = TRUE)
+  ) %>%
+  rename(DATA = mes_ano)
+
+# Dividir em duas metades
+total_meses <- nrow(df_mensal)
+meio <- floor(total_meses / 2)
+df_primeira_metade <- head(df_mensal, meio)
+
+# Rodar o modelo específico que queremos diagnosticar
+ts_data_p1 <- ts(df_primeira_metade[, c("retorno_IBOV", "crescimento_dividendos")], start=c(year(min(df_primeira_metade$DATA)), month(min(df_primeira_metade$DATA))), frequency = 12)
+lag_select_p1 <- VARselect(ts_data_p1, lag.max = 6, type = "const")
+p_otimo_p1 <- lag_select_p1$selection["AIC(n)"]
+
+# Nosso objeto de interesse
+modelo_para_diagnostico <- VAR(ts_data_p1, p = p_otimo_p1, type = "const")
+
+print("--- Modelo da Primeira Metade pronto para diagnóstico ---")
+summary(modelo_para_diagnostico)
+```
+
+```{r}
+#-----------------------------------------------------------------------
+# CÉLULA 2: TESTES DE DIAGNÓSTICO DOS RESÍDUOS
+#-----------------------------------------------------------------------
+
+# 1. Teste de Autocorrelação dos Resíduos (Portmanteau Test)
+# Hipótese Nula (H0): Os resíduos não têm autocorrelação serial (são independentes).
+# Queremos um p-valor ALTO (> 0.05) para NÃO rejeitar H0. Isso é um bom sinal.
+print("--- 1. Teste de Autocorrelação dos Resíduos (Portmanteau) ---")
+diagnostico_serial <- serial.test(modelo_para_diagnostico, lags.pt = 12, type = "PT.asymptotic")
+print(diagnostico_serial)
+
+
+# 2. Teste de Normalidade dos Resíduos (Jarque-Bera Test)
+# Hipótese Nula (H0): Os resíduos são normalmente distribuídos.
+# Idealmente, queremos um p-valor ALTO (> 0.05) para NÃO rejeitar H0.
+# No entanto, em dados financeiros, é muito comum que os resíduos não sejam perfeitamente normais.
+print("--- 2. Teste de Normalidade dos Resíduos (Jarque-Bera) ---")
+diagnostico_normalidade <- normality.test(modelo_para_diagnostico)
+print(diagnostico_normalidade)
+
+
+# 3. Teste de Estabilidade dos Parâmetros (Teste CUSUM)
+# Este é um teste visual. Ele plota os erros acumulados para cada equação do modelo.
+# Se a linha preta (erros acumulados) permanecer DENTRO das linhas vermelhas (banda de confiança),
+# isso é uma forte evidência de que os coeficientes do modelo são estáveis ao longo do tempo.
+print("--- 3. Teste de Estabilidade dos Parâmetros (CUSUM) ---")
+# install.packages("forecast") # Pode ser necessário instalar
+diagnostico_estabilidade <- stability(modelo_para_diagnostico, type = "OLS-CUSUM")
+plot(diagnostico_estabilidade)
+```
+
+```{r}
+#-----------------------------------------------------------------------
+# CÉLULA FINAL: VISUALIZAÇÕES DE DIAGNÓSTICO E DA TESE PRINCIPAL
+#-----------------------------------------------------------------------
+
+# 1. Gráfico da Distribuição dos Resíduos (para ver Kurtosis e Skew)
+# ---------------------------------------------------------------------
+
+print("--- Gerando Gráfico de Distribuição dos Resíduos ---")
+
+# Extrair os resíduos do modelo da primeira metade
+residuos <- as.data.frame(residuals(modelo_para_diagnostico))
+
+# Plotar a distribuição para cada variável
+grafico_distribuicao <- ggplot(residuos, aes(x = retorno_IBOV)) +
+  # Histograma com curva de densidade dos dados reais
+  geom_histogram(aes(y = after_stat(density)), bins = 30, fill = "lightblue", color = "black", alpha = 0.7) +
+  geom_density(color = "blue", size = 1, linetype = "dashed") +
+  
+  # Adiciona a curva de uma distribuição normal teórica (em vermelho) para comparação
+  stat_function(fun = dnorm, args = list(mean = mean(residuos$retorno_IBOV), sd = sd(residuos$retorno_IBOV)), 
+                color = "red", size = 1) +
+  
+  labs(title = "Distribuição dos Resíduos vs. Curva Normal (retorno_IBOV)",
+       subtitle = "Azul: Densidade Real dos Dados | Vermelho: Distribuição Normal Teórica",
+       x = "Valor do Resíduo", y = "Densidade") +
+  theme_minimal()
+
+print(grafico_distribuicao) # Mostra o gráfico para a primeira variável (IBOV)
+# Você pode trocar 'retorno_IBOV' por 'crescimento_dividendos' para ver o outro.
+
+
+# 2. Gráfico IBOV vs. SELIC com a Quebra Estrutural
+# ---------------------------------------------------------------------
+
+print("--- Gerando Gráfico Final IBOV vs. SELIC ---")
+
+# Fator de escala para ajustar a SELIC à escala do IBOV
+# Usamos o dataframe 'df' original, que tem os dados diários
+scaling_factor_selic <- max(df$IBOV, na.rm = TRUE) / max(df$SELIC, na.rm = TRUE)
+
+grafico_ibov_selic <- ggplot(df, aes(x = DATA)) +
+  
+  # Linha do Ibovespa (eixo da esquerda)
+  geom_line(aes(y = IBOV, color = "Ibovespa"), size = 1) +
+  
+  # Linha da Selic (eixo da direita, ajustada pela escala)
+  geom_line(aes(y = SELIC * scaling_factor_selic, color = "Taxa Selic"), size = 1, linetype = "twodash") +
+  
+  # Linha vertical marcando a data da quebra estrutural
+  geom_vline(xintercept = as.numeric(data_da_quebra), 
+             linetype = "dashed", 
+             color = "black", 
+             size = 1.2) +
+  
+  # Anotação de texto para a linha de quebra
+  annotate("text", x = data_da_quebra, y = max(df$IBOV)*0.4, 
+           label = paste("Ponto de Inflexão\n", format(data_da_quebra, "%b %Y")), 
+           hjust = 1.1, vjust = 0, color = "black", size = 3.5) +
+  
+  # Configuração do eixo Y duplo
+  scale_y_continuous(
+    name = "Ibovespa (Pontos)",
+    sec.axis = sec_axis(~./scaling_factor_selic, 
+                        name = "Taxa Selic (%)",
+                        labels = function(x) paste0(round(x,0), "%"))
+  ) +
+  
+  # Títulos e legendas
+  labs(
+    title = "Ibovespa vs. Taxa Selic: A Mudança de Paradigma",
+    subtitle = "A relação entre mercado e juros se intensifica após o ponto de inflexão",
+    x = "Data",
+    y = "",
+    color = "Métrica"
+  ) +
+  
+  # Tema e cores
+  theme_minimal() +
+  scale_color_manual(values = c("Ibovespa" = "darkblue", "Taxa Selic" = "red")) +
+  theme(legend.position = "top")
+
+# Imprimir o gráfico final
+print(grafico_ibov_selic)
+```
