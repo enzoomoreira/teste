@@ -20,3 +20,38 @@ df_eventos_filtrado.dropna(subset=['data_envio', 'ticker'], inplace=True)
 
 logging.info(f"Total de {len(df_eventos_filtrado)} eventos carregados e filtrados para os tickers de análise.")
 display(df_eventos_filtrado.head())
+
+# ==============================================================================
+# CÉLULA 4: COLETA DE DADOS EM MASSA (BULK DATA FETCHING)
+# ==============================================================================
+# Comentário: Fazemos uma única chamada para todos os tickers de uma vez,
+# para todos os módulos e históricos de preço que precisamos. Em seguida,
+# limpamos e padronizamos os dados para uso futuro.
+
+# Usamos a lista expandida que inclui o Ibovespa
+tickers_para_fetch = list(set(TICKERS_PARA_COLETA)) # <-- ALTERADO
+logging.info(f"Iniciando coleta de dados em massa para {len(tickers_para_fetch)} símbolos: {tickers_para_fetch}")
+
+# --- 1. Coleta de Módulos Fundamentalistas (Apenas para tickers de empresas) ---
+modulos_corretos = 'financialData defaultKeyStatistics earningsHistory'
+ticker_obj_bulk = yq.Ticker(TICKERS_PARA_ANALISE, asynchronous=True) # <-- ALTERADO (não buscamos módulos para o ^BVSP)
+dados_fundamentalistas = ticker_obj_bulk.get_modules(modulos_corretos)
+logging.info("Dados fundamentalistas coletados.")
+
+# --- 2. Coleta e Padronização de Históricos de Preços (Para todos, incluindo ^BVSP) ---
+ticker_obj_hist = yq.Ticker(tickers_para_fetch, asynchronous=True) # <-- ALTERADO
+dados_historicos_bruto = ticker_obj_hist.history(period='max', interval='1d')
+logging.info("Históricos de preços brutos coletados.")
+
+# Limpeza e Preparação do DataFrame de Históricos
+dados_historicos = dados_historicos_bruto.reset_index()
+dados_historicos['date'] = pd.to_datetime(dados_historicos['date'], utc=True)
+dados_historicos.drop_duplicates(subset=['symbol', 'date'], keep='last', inplace=True)
+dados_historicos.set_index(['symbol', 'date'], inplace=True)
+dados_historicos.sort_index(inplace=True)
+
+# Preencher valores ausentes no volume, comum em dados de índices
+dados_historicos['volume'].fillna(0, inplace=True) # <-- NOVO
+
+logging.info("Históricos de preços limpos, padronizados para UTC e ordenados.")
+print("\nColeta de dados em massa concluída. Os dados estão em memória, prontos para o enriquecimento.")
