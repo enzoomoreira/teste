@@ -1,0 +1,22 @@
+# ==============================================================================
+# CÉLULA 3: CARGA DE DADOS-RAIZ (EVENTOS)
+# ==============================================================================
+# Comentário: Carregamos os eventos (releases com sentiment_score) do nosso
+# banco de dados local para iniciar o processo.
+
+with open(TICKER_MAP_PATH, 'r', encoding='utf-8') as f:
+    ticker_map = json.load(f)
+
+engine = create_engine(f"sqlite:///{DB_PATH}")
+query = """
+SELECT d.protocolo_id, d.empresa, d.data_envio, a.sentiment_score
+FROM documents d JOIN analyses a ON d.id = a.document_id
+WHERE d.data_envio IS NOT NULL;
+"""
+df_eventos = pd.read_sql(query, engine)
+df_eventos['ticker'] = df_eventos['empresa'].map(ticker_map)
+df_eventos_filtrado = df_eventos[df_eventos['ticker'].isin(TICKERS_PARA_ANALISE)].copy()
+df_eventos_filtrado.dropna(subset=['data_envio', 'ticker'], inplace=True)
+
+logging.info(f"Total de {len(df_eventos_filtrado)} eventos carregados e filtrados para os tickers de análise.")
+display(df_eventos_filtrado.head())
